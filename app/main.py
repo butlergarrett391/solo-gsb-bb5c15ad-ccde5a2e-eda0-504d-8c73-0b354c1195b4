@@ -3,9 +3,10 @@ from __future__ import annotations
 
 import sqlite3
 from contextlib import asynccontextmanager
+from datetime import datetime, timezone
 from typing import Any
 
-from fastapi import Depends, FastAPI, HTTPException, Response
+from fastapi import Depends, FastAPI, HTTPException, Query, Response
 
 from . import crypto
 from .config import settings
@@ -17,6 +18,7 @@ from .database import (
     row_to_dict,
 )
 from .schemas import GenericMessage, ProofIn, RevokeIn, RevokeResponse, WriteProofResponse
+from .timeutil import parse_rfc3339_utc
 from .verifier import verify_artifact
 
 
@@ -136,9 +138,28 @@ def list_proofs(
     summary="从根递归校验制品的完整证明链",
 )
 def verify(
-    artifact_digest: str, conn: sqlite3.Connection = Depends(db)
+    artifact_digest: str,
+    at: str | None = Query(
+        default=None,
+        description=(
+            "历史时点 (RFC3339 UTC, 如 2026-09-22T08:00:00Z)。"
+            "传入时只基于 created_at/revoked_at <= at 的数据求值, "
+            "响应附带 evaluated_at。"
+        ),
+    ),
+    conn: sqlite3.Connection = Depends(db),
 ) -> dict[str, Any]:
-    result = verify_artifact(conn, artifact_digest, settings)
+    at_dt: datetime | None = None
+    if at is not None:
+        try:
+            at_dt = parse_rfc3339_utc(at)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+        if at_dt > datetime.now(timezone.utc):
+            raise HTTPException(
+                status_code=400, detail="at 晚于当前时间, 无法对未来时点求值"
+            )
+    result = verify_artifact(conn, artifact_digest, settings, at=at_dt)
     if result["status"] == "NOT_FOUND":
         raise HTTPException(status_code=404, detail=result["failure"]["detail"])
     return result

@@ -6,6 +6,7 @@
 - 写入时校验公钥格式；**校验时验证 Ed25519 签名**，并从被校验制品出发**沿父链递归直到信任根**
 - 同一制品出现**分叉**（多条不同证明）或链上存在**被撤销祖先**时，返回带有序节点的 **可定位失败路径**
 - 校验成功时返回**有序信任链**（target → … → root）
+- 支持 `?at=<RFC3339 UTC>` **历史时点校验**：只基于该时点已可见的证明与已生效的撤销求值，晚到分叉/后续撤销不改变更早时点的结论
 - 提供记录写入、制品校验、撤销、记录查询接口
 - Dockerfile + Docker Compose 一键启动，SQLite 数据持久化到命名卷
 
@@ -80,7 +81,7 @@ print(encode_public_key(priv.public_key()))   # 填入 docker-compose.yml 的 TR
 | --- | --- | --- |
 | `POST` | `/proofs` | 写入一条证明记录（内容完全相同的重复提交幂等去重，返回 `200`） |
 | `GET` | `/proofs/artifact/{artifact_digest}` | 列出某制品的全部证明记录 |
-| `GET` | `/verify/{artifact_digest}` | 递归校验完整证明链 |
+| `GET` | `/verify/{artifact_digest}` | 递归校验完整证明链；可选 `?at=<RFC3339 UTC>` 做历史时点校验 |
 | `POST` | `/revocations` | 撤销一个制品（幂等，已撤销返回 `200`） |
 | `GET` | `/revocations` | 列出全部撤销记录 |
 | `GET` | `/revocations/{artifact_digest}` | 查询单个制品撤销状态 |
@@ -146,6 +147,16 @@ print(encode_public_key(priv.public_key()))   # 填入 docker-compose.yml 的 TR
 }
 ```
 
+#### 历史时点校验 `?at=<RFC3339 UTC>`
+
+```bash
+curl "http://localhost:8080/verify/sha256:image?at=2026-09-22T08:00:00Z"
+```
+
+- **数据可见性**：只读取 `created_at <= at` 的证明记录，且仅 `revoked_at <= at` 的撤销视为生效（边界均为闭区间）。因此**晚到的分叉/父证明、以及时点之后的撤销，都不会改变更早时点的结论**。
+- **`evaluated_at`**：传入 `at` 时响应附带该字段，为归一化后的 UTC 毫秒串（如 `2026-09-22T08:00:00.000Z`）；带偏移的输入（如 `+08:00`，需 URL 编码为 `%2B`）会归一化为 UTC。未传 `at` 时响应结构与之前完全一致，不含该字段。
+- **错误语义**：`at` 非法（非 RFC3339、缺时区偏移等）或**晚于当前时间**返回 `400`；该时点尚无目标制品的任何证明记录仍返回 `404`；其余状态码与失败路径语义与实时校验相同。
+
 ### 3.3 撤销制品 `POST /revocations`
 
 ```json
@@ -174,6 +185,8 @@ signature = sign(priv, "sha256:abc123", "sha256:def456")  # parent 为 None 表�
 5. 沿 `parent_digest` 向上重复 2–4；父节点缺失 / 分叉 / 撤销 / 签名非法 / 成环均带有序失败路径返回。
 6. 到达根（`parent_digest` 为空）时，根 `issuer` 必须在信任根集合中，否则 `UNTRUSTED_ROOT`。
 
+传入 `?at=` 时，上述规则中的“存在记录”与“已撤销”均按该时点判定（`created_at <= at`、`revoked_at <= at`），规则本身与返回结构不变。
+
 ## 5. 环境变量
 
 | 变量 | 默认值 | 说明 |
@@ -189,7 +202,7 @@ python3 -m pip install pytest httpx
 python3 -m pytest -q
 ```
 
-覆盖：合法链/根、签名往返、幂等写入与撤销、目标/祖先分叉、目标/祖先撤销定位、非法签名、缺失父节点、成环、非信任根等 17 个用例。
+覆盖：合法链/根、签名往返、幂等写入与撤销、目标/祖先分叉、目标/祖先撤销定位、非法签名、缺失父节点、成环、非信任根，以及历史时点校验（非法/未来 `at` → 400、时点前 404、时间边界闭区间、`evaluated_at` 归一化、晚到分叉、晚到父证明、撤销前后）等 26 个用例。
 
 ## 7. 目录结构
 
@@ -197,9 +210,10 @@ python3 -m pytest -q
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由
-│   ├── verifier.py    # 递归校验 / 分叉 / 撤销 / 失败路径
+│   ├── verifier.py    # 递归校验 / 分叉 / 撤销 / 失败路径 / 历史时点求值
 │   ├── crypto.py      # Ed25519 与规范化签名载荷
-│   ├── database.py    # SQLite 表结构与查询
+│   ├── database.py    # SQLite 表结构与查询 (含时点过滤)
+│   ├── timeutil.py    # RFC3339 解析与 UTC 毫秒格式化
 │   ├── config.py      # 环境变量配置
 │   └── schemas.py     # Pydantic 模型
 ├── demo/demo.py       # 端到端演示

@@ -332,3 +332,191 @@ def test_untrusted_root_enforced():
         assert body["length"] == 2
 
     app2.dependency_overrides.clear()
+
+
+# ---------- 历史时点校验 (?at=) ----------
+
+# 固定历史时点 (均早于当前时间, 保证不会被未来时间检查拦截)
+T0 = "2020-01-01T00:00:00.000Z"
+T1 = "2020-01-01T01:00:00.000Z"
+T2 = "2020-01-01T02:00:00.000Z"
+T3 = "2020-01-01T03:00:00.000Z"
+
+
+def _set_created_at(conn, artifact, ts, issuer=None):
+    sql = "UPDATE proofs SET created_at = ? WHERE artifact_digest = ?"
+    params = [ts, artifact]
+    if issuer is not None:
+        sql += " AND issuer = ?"
+        params.append(issuer)
+    conn.execute(sql, params)
+    conn.commit()
+
+
+def _set_revoked_at(conn, artifact, ts):
+    conn.execute(
+        "UPDATE revocations SET revoked_at = ? WHERE artifact_digest = ?",
+        (ts, artifact),
+    )
+    conn.commit()
+
+
+def test_verify_at_invalid_format_400(client):
+    c, _ = client
+    for bad in (
+        "not-a-time",
+        "2020-01-01",                    # 缺少时间部分
+        "2020-01-01T01:00:00",           # 缺少时区偏移
+        "2020-13-01T00:00:00Z",          # 非法月份
+        "2020-01-01 01:00:00Z",          # 非 T 分隔
+        "",
+    ):
+        res = c.get(f"/verify/sha256:x?at={bad}")
+        assert res.status_code == 400, bad
+
+
+def test_verify_at_future_400(client):
+    c, _ = client
+    res = c.get("/verify/sha256:x?at=2999-01-01T00:00:00Z")
+    assert res.status_code == 400
+
+
+def test_verify_at_before_any_proof_404(client):
+    c, _ = client
+    priv, pub = _keypair()
+    _post_proof(c, priv, pub, "sha256:new")
+    # 该时点还没有任何证明记录
+    assert c.get(f"/verify/sha256:new?at={T0}").status_code == 404
+
+
+def test_verify_at_time_boundary_inclusive(client):
+    c, conn = client
+    priv, pub = _keypair()
+    _post_proof(c, priv, pub, "sha256:edge")
+    _set_created_at(conn, "sha256:edge", T1)
+
+    # at 恰好等于 created_at -> 记录可见 (边界为闭区间)
+    res = c.get(f"/verify/sha256:edge?at={T1}")
+    assert res.status_code == 200
+    body = res.json()
+    assert body["status"] == "OK"
+    assert body["evaluated_at"] == T1
+
+    # 早 1ms -> 该时点尚无证明
+    assert (
+        c.get("/verify/sha256:edge?at=2020-01-01T00:59:59.999Z").status_code == 404
+    )
+
+
+def test_verify_at_evaluated_at_field(client):
+    c, conn = client
+    priv, pub = _keypair()
+    _post_proof(c, priv, pub, "sha256:field")
+    _set_created_at(conn, "sha256:field", T1)
+
+    body = c.get(f"/verify/sha256:field?at={T2}").json()
+    assert body["evaluated_at"] == T2
+
+    # 带偏移的 RFC3339 输入被归一化为 UTC (params 会自动 URL 编码 "+")
+    body = c.get(
+        "/verify/sha256:field", params={"at": "2020-01-01T10:00:00+08:00"}
+    ).json()
+    assert body["evaluated_at"] == T2
+
+    # 未传 at 时响应保持原样, 不含 evaluated_at
+    body = c.get("/verify/sha256:field").json()
+    assert body["status"] == "OK"
+    assert "evaluated_at" not in body
+
+
+def test_verify_at_late_fork_does_not_change_earlier_verdict(client):
+    c, conn = client
+    k1, p1 = _keypair()
+    k2, p2 = _keypair()
+    _post_proof(c, k1, p1, "sha256:root")
+    _post_proof(c, k1, p1, "sha256:child", parent="sha256:root")
+    _set_created_at(conn, "sha256:root", T0)
+    _set_created_at(conn, "sha256:child", T1)
+
+    # 分叉前的时点: 链完整可信
+    body = c.get(f"/verify/sha256:child?at={T2}").json()
+    assert body["status"] == "OK"
+    assert body["length"] == 2
+
+    # 晚到的分叉证明 (T3 才写入)
+    _post_proof(c, k2, p2, "sha256:child", parent="sha256:root")
+    _set_created_at(conn, "sha256:child", T3, issuer=p2)
+
+    # 更早时点的结论不受晚到分叉影响
+    body = c.get(f"/verify/sha256:child?at={T2}").json()
+    assert body["status"] == "OK"
+    assert body["evaluated_at"] == T2
+
+    # 分叉生效时点及现在均为 FORK
+    assert c.get(f"/verify/sha256:child?at={T3}").json()["status"] == "FORK"
+    assert c.get("/verify/sha256:child").json()["status"] == "FORK"
+
+
+def test_verify_at_late_parent_arrival(client):
+    c, conn = client
+    priv, pub = _keypair()
+    # 子证明先于父证明到达
+    _post_proof(c, priv, pub, "sha256:leaf", parent="sha256:base")
+    _set_created_at(conn, "sha256:leaf", T1)
+
+    body = c.get(f"/verify/sha256:leaf?at={T1}").json()
+    assert body["status"] == "MISSING_PARENT"
+
+    _post_proof(c, priv, pub, "sha256:base")
+    _set_created_at(conn, "sha256:base", T2)
+
+    body = c.get(f"/verify/sha256:leaf?at={T2}").json()
+    assert body["status"] == "OK"
+    assert body["length"] == 2
+
+
+def test_verify_at_revocation_boundary(client):
+    c, conn = client
+    priv, pub = _keypair()
+    _build_chain(c, priv, pub, n=2)
+    _set_created_at(conn, "sha256:root", T0)
+    _set_created_at(conn, "sha256:a1", T1)
+
+    r = c.post("/revocations", json={"artifact_digest": "sha256:a1", "reason": "CVE"})
+    assert r.status_code == 201
+    _set_revoked_at(conn, "sha256:a1", T2)
+
+    # 撤销生效前: 仍然可信
+    body = c.get(f"/verify/sha256:a1?at={T1}").json()
+    assert body["status"] == "OK"
+
+    # revoked_at 边界: 撤销恰好生效 (闭区间)
+    body = c.get(f"/verify/sha256:a1?at={T2}").json()
+    assert body["status"] == "REVOKED"
+    assert body["evaluated_at"] == T2
+
+    # 现在 (不带 at): 撤销生效
+    assert c.get("/verify/sha256:a1").json()["status"] == "REVOKED"
+
+
+def test_verify_at_revoked_ancestor_not_retroactive(client):
+    c, conn = client
+    priv, pub = _keypair()
+    digests = _build_chain(c, priv, pub, n=3)
+    _set_created_at(conn, "sha256:root", T0)
+    _set_created_at(conn, "sha256:a1", T1)
+    _set_created_at(conn, "sha256:a2", T2)
+
+    c.post("/revocations", json={"artifact_digest": "sha256:root", "reason": "ROTATED"})
+    _set_revoked_at(conn, "sha256:root", T3)
+
+    # 撤销前的历史时点: 链仍然 OK
+    body = c.get(f"/verify/{digests[-1]}?at={T2}").json()
+    assert body["status"] == "OK"
+    assert body["length"] == 3
+
+    # 撤销生效后: 失败路径可定位到被撤销的祖先
+    body = c.get(f"/verify/{digests[-1]}?at={T3}").json()
+    assert body["status"] == "REVOKED"
+    assert body["failure_path"][-1]["relation"] == "revoked_ancestor"
+    assert body["failure_path"][-1]["revocation"]["reason"] == "ROTATED"
