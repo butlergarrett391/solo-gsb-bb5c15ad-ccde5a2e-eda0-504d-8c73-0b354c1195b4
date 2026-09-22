@@ -71,19 +71,44 @@ def row_to_dict(row: sqlite3.Row) -> dict[str, Any]:
     return {k: row[k] for k in row.keys()}
 
 
-def fetch_proofs(conn: sqlite3.Connection, artifact_digest: str) -> list[dict[str, Any]]:
-    rows: Iterable[sqlite3.Row] = conn.execute(
-        "SELECT * FROM proofs WHERE artifact_digest = ? ORDER BY id",
-        (artifact_digest,),
-    ).fetchall()
+def fetch_proofs(
+    conn: sqlite3.Connection,
+    artifact_digest: str,
+    at: str | None = None,
+) -> list[dict[str, Any]]:
+    """读取某制品的证明记录。
+
+    at 不为 None 时 (历史时点校验) 仅返回 created_at <= at 的记录;
+    at 为与 created_at 同格式的 UTC 毫秒字符串, 可直接做字典序比较。
+    """
+    if at is None:
+        rows: Iterable[sqlite3.Row] = conn.execute(
+            "SELECT * FROM proofs WHERE artifact_digest = ? ORDER BY id",
+            (artifact_digest,),
+        ).fetchall()
+    else:
+        rows = conn.execute(
+            "SELECT * FROM proofs WHERE artifact_digest = ? AND created_at <= ?"
+            " ORDER BY id",
+            (artifact_digest, at),
+        ).fetchall()
     return [row_to_dict(r) for r in rows]
 
 
 def fetch_revocation(
-    conn: sqlite3.Connection, artifact_digest: str
+    conn: sqlite3.Connection,
+    artifact_digest: str,
+    at: str | None = None,
 ) -> dict[str, Any] | None:
-    row = conn.execute(
-        "SELECT * FROM revocations WHERE artifact_digest = ?",
-        (artifact_digest,),
-    ).fetchone()
+    """读取撤销记录; at 不为 None 时仅把 revoked_at <= at 的撤销视为已生效。"""
+    if at is None:
+        row = conn.execute(
+            "SELECT * FROM revocations WHERE artifact_digest = ?",
+            (artifact_digest,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            "SELECT * FROM revocations WHERE artifact_digest = ? AND revoked_at <= ?",
+            (artifact_digest, at),
+        ).fetchone()
     return row_to_dict(row) if row else None

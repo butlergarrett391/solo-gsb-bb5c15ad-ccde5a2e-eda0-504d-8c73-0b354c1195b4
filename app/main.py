@@ -17,6 +17,7 @@ from .database import (
     row_to_dict,
 )
 from .schemas import GenericMessage, ProofIn, RevokeIn, RevokeResponse, WriteProofResponse
+from .timeutil import format_db_timestamp, parse_rfc3339, utcnow
 from .verifier import verify_artifact
 
 
@@ -133,12 +134,25 @@ def list_proofs(
 @app.get(
     "/verify/{artifact_digest}",
     tags=["verify"],
-    summary="从根递归校验制品的完整证明链",
+    summary="从根递归校验制品的完整证明链 (可选历史时点)",
 )
 def verify(
-    artifact_digest: str, conn: sqlite3.Connection = Depends(db)
+    artifact_digest: str,
+    at: str | None = None,
+    conn: sqlite3.Connection = Depends(db),
 ) -> dict[str, Any]:
-    result = verify_artifact(conn, artifact_digest, settings)
+    # 历史时点校验: 仅 created_at<=at 的证明可见, 仅 revoked_at<=at 的撤销生效。
+    evaluated_at: str | None = None
+    if at is not None:
+        try:
+            at_dt = parse_rfc3339(at)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=f"at 参数非法: {exc}") from exc
+        if at_dt > utcnow():
+            raise HTTPException(status_code=400, detail="at 参数晚于当前时间")
+        evaluated_at = format_db_timestamp(at_dt)
+
+    result = verify_artifact(conn, artifact_digest, settings, at=evaluated_at)
     if result["status"] == "NOT_FOUND":
         raise HTTPException(status_code=404, detail=result["failure"]["detail"])
     return result

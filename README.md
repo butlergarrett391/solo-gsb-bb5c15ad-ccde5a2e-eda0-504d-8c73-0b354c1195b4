@@ -6,6 +6,7 @@
 - 写入时校验公钥格式；**校验时验证 Ed25519 签名**，并从被校验制品出发**沿父链递归直到信任根**
 - 同一制品出现**分叉**（多条不同证明）或链上存在**被撤销祖先**时，返回带有序节点的 **可定位失败路径**
 - 校验成功时返回**有序信任链**（target → … → root）
+- 支持**历史时点校验**（`GET /verify/{digest}?at=<RFC3339 UTC>`）：只读取 `created_at<=at` 的证明、只把 `revoked_at<=at` 的撤销视为生效，晚到的分叉或后续撤销不会改变更早时点的结论
 - 提供记录写入、制品校验、撤销、记录查询接口
 - Dockerfile + Docker Compose 一键启动，SQLite 数据持久化到命名卷
 
@@ -80,7 +81,7 @@ print(encode_public_key(priv.public_key()))   # 填入 docker-compose.yml 的 TR
 | --- | --- | --- |
 | `POST` | `/proofs` | 写入一条证明记录（内容完全相同的重复提交幂等去重，返回 `200`） |
 | `GET` | `/proofs/artifact/{artifact_digest}` | 列出某制品的全部证明记录 |
-| `GET` | `/verify/{artifact_digest}` | 递归校验完整证明链 |
+| `GET` | `/verify/{artifact_digest}` | 递归校验完整证明链；可选 `?at=<RFC3339 UTC>` 做历史时点校验 |
 | `POST` | `/revocations` | 撤销一个制品（幂等，已撤销返回 `200`） |
 | `GET` | `/revocations` | 列出全部撤销记录 |
 | `GET` | `/revocations/{artifact_digest}` | 查询单个制品撤销状态 |
@@ -146,6 +147,33 @@ print(encode_public_key(priv.public_key()))   # 填入 docker-compose.yml 的 TR
 }
 ```
 
+#### 历史时点校验 `?at=<RFC3339 UTC>`
+
+加上查询参数 `at` 可回答“**在过去某个时点，这条链是否可信**”：
+
+```bash
+curl 'http://localhost:8080/verify/sha256:image?at=2026-09-01T12:00:00Z'
+```
+
+语义：
+
+- 只有 `created_at <= at` 的证明记录参与校验（边界取等，精确到毫秒）；
+- 只有 `revoked_at <= at` 的撤销视为已生效；
+- 因此**晚到的分叉证明、晚到的父证明或后续发生的撤销，都不会改变更早时点的结论**——同一 `at` 重复查询结果稳定；
+- 响应中增加 `evaluated_at` 字段，为归一化后的 UTC 评估时点（如 `2026-09-01T12:00:00.000Z`）；
+- `at` 必须携带 UTC 偏移（`Z` 或 `±HH:MM`，带偏移的时间会归一化为 UTC 再比较）。
+
+错误与边界：
+
+| 情形 | 状态码 |
+| --- | --- |
+| `at` 非法（不是 RFC3339、缺少时区偏移等） | `400` |
+| `at` 晚于当前时间 | `400` |
+| 该时点目标证明尚未写入 | `404`（与“制品不存在”语义一致） |
+| 其余成功/失败路径与状态码 | 与不传 `at` 时完全一致 |
+
+不传 `at` 时行为与之前版本完全相同（按当前全部记录校验，响应无 `evaluated_at`）。
+
 ### 3.3 撤销制品 `POST /revocations`
 
 ```json
@@ -173,6 +201,7 @@ signature = sign(priv, "sha256:abc123", "sha256:def456")  # parent 为 None 表�
 4. 用记录内 `issuer` 公钥对 canonical message 验签，失败 → `INVALID_SIGNATURE`。
 5. 沿 `parent_digest` 向上重复 2–4；父节点缺失 / 分叉 / 撤销 / 签名非法 / 成环均带有序失败路径返回。
 6. 到达根（`parent_digest` 为空）时，根 `issuer` 必须在信任根集合中，否则 `UNTRUSTED_ROOT`。
+7. 历史时点校验（`?at=`）在上述所有规则之前先按时间过滤数据：仅 `created_at <= at` 的证明可见、仅 `revoked_at <= at` 的撤销生效，其余规则不变。
 
 ## 5. 环境变量
 
@@ -189,7 +218,7 @@ python3 -m pip install pytest httpx
 python3 -m pytest -q
 ```
 
-覆盖：合法链/根、签名往返、幂等写入与撤销、目标/祖先分叉、目标/祖先撤销定位、非法签名、缺失父节点、成环、非信任根等 17 个用例。
+覆盖：合法链/根、签名往返、幂等写入与撤销、目标/祖先分叉、目标/祖先撤销定位、非法签名、缺失父节点、成环、非信任根，以及历史时点校验（非法/未来 `at` 返回 400、时点前 404、`created_at`/`revoked_at` 边界取等、晚到分叉不改变更早结论、撤销前后结论、晚到父证明、时区偏移归一化）等 25 个用例。
 
 ## 7. 目录结构
 
@@ -197,9 +226,10 @@ python3 -m pytest -q
 .
 ├── app/
 │   ├── main.py        # FastAPI 路由
-│   ├── verifier.py    # 递归校验 / 分叉 / 撤销 / 失败路径
+│   ├── verifier.py    # 递归校验 / 分叉 / 撤销 / 失败路径 / 历史时点过滤
 │   ├── crypto.py      # Ed25519 与规范化签名载荷
-│   ├── database.py    # SQLite 表结构与查询
+│   ├── database.py    # SQLite 表结构与查询 (含时点过滤)
+│   ├── timeutil.py    # RFC3339 解析与 UTC 时间戳格式化
 │   ├── config.py      # 环境变量配置
 │   └── schemas.py     # Pydantic 模型
 ├── demo/demo.py       # 端到端演示

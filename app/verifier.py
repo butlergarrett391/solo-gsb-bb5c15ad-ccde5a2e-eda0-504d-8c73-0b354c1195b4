@@ -10,6 +10,10 @@
      全部带上可定位的有序失败路径返回。
 6. 根记录 (parent_digest 为空) 的 issuer 必须属于信任根集合;
    未配置 TRUSTED_ROOT_ISSUERS 时退化为“任意自签名根均可接受”(仅建议开发环境使用)。
+
+历史时点校验 (at 参数): 仅 created_at <= at 的证明参与校验,
+仅 revoked_at <= at 的撤销视为生效; 晚到的分叉证明或后续撤销
+不会改变更早时点的结论。
 """
 from __future__ import annotations
 
@@ -95,7 +99,11 @@ def _dedupe(records: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return unique
 
 
-def _branch_summary(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[str, Any]:
+def _branch_summary(
+    conn: sqlite3.Connection,
+    record: dict[str, Any],
+    at: str | None = None,
+) -> dict[str, Any]:
     """分叉点处单条分支的即时摘要 (签名/撤销状态)。"""
     sig_ok = crypto.verify(
         record["issuer"],
@@ -103,7 +111,7 @@ def _branch_summary(conn: sqlite3.Connection, record: dict[str, Any]) -> dict[st
         record["parent_digest"],
         record["signature"],
     )
-    rev = fetch_revocation(conn, record["artifact_digest"])
+    rev = fetch_revocation(conn, record["artifact_digest"], at=at)
     return {
         "artifact_digest": record["artifact_digest"],
         "issuer": record["issuer"],
@@ -117,10 +125,12 @@ def _trace_terminus(
     conn: sqlite3.Connection,
     start: dict[str, Any],
     cfg: Settings,
+    at: str | None = None,
 ) -> _TraceResult:
     """从某条证明的父节点开始向上追溯, 直到根或发现故障点。
 
     返回故障 verdict/failure 以及经过的祖先节点 (不含起点, 含终止点)。
+    at 不为 None 时仅可见 created_at <= at 的证明、revoked_at <= at 的撤销。
     """
     ancestors: list[dict[str, Any]] = []
     current_parent = start["parent_digest"]
@@ -140,7 +150,7 @@ def _trace_terminus(
                 ancestors,
             )
 
-        records = _dedupe(fetch_proofs(conn, current_parent))
+        records = _dedupe(fetch_proofs(conn, current_parent, at=at))
         if not records:
             failure = _terminal_failure(
                 MISSING_PARENT,
@@ -160,7 +170,7 @@ def _trace_terminus(
                     "code": FORK,
                     "detail": f"祖先制品 {current_parent} 存在 {len(records)} 条分叉证明",
                     "at": ancestors[-1],
-                    "branches": [_branch_summary(conn, r) for r in records],
+                    "branches": [_branch_summary(conn, r, at=at) for r in records],
                 },
                 ancestors,
             )
@@ -182,7 +192,7 @@ def _trace_terminus(
             )
         visited.add(digest)
 
-        rev = fetch_revocation(conn, digest)
+        rev = fetch_revocation(conn, digest, at=at)
         if rev:
             relation = (
                 "revoked"
@@ -247,12 +257,29 @@ def verify_artifact(
     conn: sqlite3.Connection,
     artifact_digest: str,
     cfg: Settings | None = None,
+    at: str | None = None,
 ) -> dict[str, Any]:
-    """校验入口, 返回可直接序列化为 JSON 的结果字典。"""
+    """校验入口, 返回可直接序列化为 JSON 的结果字典。
+
+    at 为历史时点 (与 created_at 同格式的 UTC 毫秒字符串):
+    仅 created_at <= at 的证明参与校验, 仅 revoked_at <= at 的撤销生效,
+    响应中附带 evaluated_at; at 为 None 时按当前全部记录校验 (行为不变)。
+    """
     cfg = cfg or default_settings
     digest = artifact_digest.strip()
+    result = _evaluate(conn, digest, cfg, at)
+    if at is not None:
+        result["evaluated_at"] = at
+    return result
 
-    records = _dedupe(fetch_proofs(conn, digest))
+
+def _evaluate(
+    conn: sqlite3.Connection,
+    digest: str,
+    cfg: Settings,
+    at: str | None,
+) -> dict[str, Any]:
+    records = _dedupe(fetch_proofs(conn, digest, at=at))
     if not records:
         return {
             "artifact_digest": digest,
@@ -264,7 +291,7 @@ def verify_artifact(
         }
 
     # 目标制品自身被撤销 (无论有几条证明)。
-    rev = fetch_revocation(conn, digest)
+    rev = fetch_revocation(conn, digest, at=at)
     if rev:
         record = records[0]
         return {
@@ -289,7 +316,7 @@ def verify_artifact(
                 "code": FORK,
                 "detail": f"制品 {digest} 存在 {len(records)} 条分叉证明, 信任链不唯一",
                 "at": _entry(records[0], "fork_point"),
-                "branches": [_branch_summary(conn, r) for r in records],
+                "branches": [_branch_summary(conn, r, at=at) for r in records],
             },
             "chain": [],
         }
@@ -342,7 +369,7 @@ def verify_artifact(
             "length": 1,
         }
 
-    trace = _trace_terminus(conn, record, cfg)
+    trace = _trace_terminus(conn, record, cfg, at=at)
     if trace.verdict != OK:
         return {
             "artifact_digest": digest,
